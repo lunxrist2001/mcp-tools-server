@@ -55,10 +55,12 @@ async function main() {
   const port = parseInt(process.env.PORT || "3001", 10);
   http.createServer(async (req, res) => {
     try {
-      if (req.url === "/health" || req.url === "/") { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok" })); return; }
+      if (req.method === "GET" && (req.url === "/health" || req.url === "/")) { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok" })); return; }
       if (req.method !== "POST") { res.writeHead(405).end("Method not allowed"); return; }
       const chunks = []; for await (const c of req) chunks.push(c);
-      const body = JSON.parse(Buffer.concat(chunks).toString());
+      const raw = Buffer.concat(chunks).toString();
+      if (!raw.includes("jsonrpc")) { res.writeHead(400).end("Not a JSON-RPC request"); return; }
+      const body = JSON.parse(raw);
 
       const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
       await server.connect(transport);
