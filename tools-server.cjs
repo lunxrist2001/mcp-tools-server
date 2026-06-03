@@ -57,9 +57,12 @@ async function main() {
   await server.connect(transport);
   http.createServer(async (req, res) => {
     try {
+      if (req.method === "GET" && req.url === "/health" || req.method === "GET" && req.url === "/") {
+        res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok" })); return;
+      }
       const chunks = []; for await (const c of req) chunks.push(c);
       await transport.handleRequest(req, res, chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined);
     } catch (e) { if (!res.headersSent) { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: e.message }, id: null })); } }
-  }).listen(port, "127.0.0.1", () => log(`Server on http://127.0.0.1:${port}/mcp`));
+  }).listen(port, "0.0.0.0", () => log(`Server on http://0.0.0.0:${port}/mcp`));
 }
 main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
