@@ -1,7 +1,7 @@
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
 const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
-const http = require("node:http"), https = require("node:https"), z = require("zod");
+const http = require("node:http"), https = require("node:https"), z = require("zod"), crypto = require("node:crypto");
 
 const log = (m) => console.error(`[TOOLS] ${m}`);
 
@@ -51,22 +51,52 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   } catch (e) { return err(e instanceof z.ZodError ? e.errors.map(x=>x.path.join(".")+": "+x.message).join("; ") : e.message); }
 });
 
+const transports = new Map();
+
 async function main() {
   const port = parseInt(process.env.PORT || "3001", 10);
   http.createServer(async (req, res) => {
     try {
-      if (req.method === "GET" && (req.url === "/health" || req.url === "/")) { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok" })); return; }
-      if (req.method !== "POST") { res.writeHead(405).end("Method not allowed"); return; }
-      const chunks = []; for await (const c of req) chunks.push(c);
-      const raw = Buffer.concat(chunks).toString();
-      if (!raw.includes("jsonrpc")) { res.writeHead(400).end("Not a JSON-RPC request"); return; }
-      const body = JSON.parse(raw);
+      const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+      log(`${req.method} ${url.pathname}`);
 
-      const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
-      await server.connect(transport);
-      await transport.handleRequest(req, res, body);
+      // Health check
+      if (url.pathname === "/health" || url.pathname === "/") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", tools: mem.size > 0 ? "memory" : "ready" }));
+        return;
+      }
+
+      // SSE endpoint - Poke AI connects here
+      if (req.method === "GET" && (url.pathname === "/sse" || url.pathname === "/mcp")) {
+        const sessionId = crypto.randomUUID();
+        const transport = new SSEServerTransport("/sse", res);
+        transports.set(sessionId, transport);
+        res.on("close", () => { transports.delete(sessionId); log(`Session ${sessionId.slice(0,8)} closed`); });
+        await server.connect(transport);
+        return;
+      }
+
+      // POST endpoint for JSON-RPC messages
+      if (req.method === "POST" && (url.pathname === "/sse" || url.pathname === "/mcp")) {
+        const sessionId = url.searchParams.get("sessionId");
+        let transport = sessionId ? transports.get(sessionId) : null;
+        if (!transport) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "No active session" }));
+          return;
+        }
+        await transport.handlePostMessage(req, res, req.headers["content-type"]);
+        return;
+      }
+      
+      res.writeHead(404).end("Not found");
     } catch (e) {
-      if (!res.headersSent) { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: e.message })); }
+      log(`Error: ${e.message}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
     }
   }).listen(port, "0.0.0.0", () => log(`Server on http://0.0.0.0:${port}`));
 }
