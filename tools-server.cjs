@@ -1,7 +1,7 @@
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
+const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
 const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
-const crypto = require("node:crypto"), http = require("node:http"), https = require("node:https"), z = require("zod");
+const http = require("node:http"), https = require("node:https"), z = require("zod");
 
 const log = (m) => console.error(`[TOOLS] ${m}`);
 
@@ -25,13 +25,14 @@ function getTime(tz) {
 const mem = new Map();
 
 const server = new Server({ name: "mcp-tools", version: "1.0.0" }, { capabilities: { tools: {} } });
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
-    { name: "fetch", description: "Fetch web page", inputSchema: { type: "object", properties: { url: { type: "string" }, maxLength: { type: "number", default: 1e5 } }, required: ["url"] } },
-    { name: "get_time", description: "Current time", inputSchema: { type: "object", properties: { timezone: { type: "string", default: "UTC" } } } },
-    { name: "memory_save", description: "Save to memory", inputSchema: { type: "object", properties: { key: { type: "string" }, value: { type: "string" } }, required: ["key","value"] } },
-    { name: "memory_get", description: "Read from memory (*all* = list all, *clear* = clear)", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
-    { name: "memory_delete", description: "Delete from memory", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+    { name: "fetch", description: "Fetch web page content", inputSchema: { type: "object", properties: { url: { type: "string" }, maxLength: { type: "number", default: 1e5 } }, required: ["url"] } },
+    { name: "get_time", description: "Get current time in a timezone (e.g. Europe/Moscow, America/New_York)", inputSchema: { type: "object", properties: { timezone: { type: "string", default: "UTC" } } } },
+    { name: "memory_save", description: "Save value to memory (key-value store)", inputSchema: { type: "object", properties: { key: { type: "string" }, value: { type: "string" } }, required: ["key","value"] } },
+    { name: "memory_get", description: "Get value from memory. *all* = list all, *clear* = clear", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+    { name: "memory_delete", description: "Delete key from memory", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
   ]
 }));
 
@@ -53,16 +54,35 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 async function main() {
   const port = parseInt(process.env.PORT || "3001", 10);
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID(), enableJsonResponse: true });
-  await server.connect(transport);
+  const transports = {};
+
   http.createServer(async (req, res) => {
     try {
-      if (req.method === "GET" && req.url === "/health" || req.method === "GET" && req.url === "/") {
+      if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
         res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok" })); return;
       }
-      const chunks = []; for await (const c of req) chunks.push(c);
-      await transport.handleRequest(req, res, chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined);
-    } catch (e) { if (!res.headersSent) { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: e.message }, id: null })); } }
-  }).listen(port, "0.0.0.0", () => log(`Server on http://0.0.0.0:${port}/mcp`));
+      if (req.method === "GET" && req.url === "/sse") {
+        const transport = new SSEServerTransport("/messages", res);
+        const sessionId = transport._sessionId;
+        transports[sessionId] = transport;
+        res.on("close", () => { delete transports[sessionId]; });
+        await server.connect(transport);
+        return;
+      }
+      if (req.method === "POST" && req.url?.startsWith("/messages")) {
+        const url = new URL(req.url, "http://localhost");
+        const sessionId = url.searchParams.get("sessionId");
+        const transport = sessionId ? transports[sessionId] : null;
+        if (!transport) { res.writeHead(404).end("Session not found"); return; }
+        const chunks = []; for await (const c of req) chunks.push(c);
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        await transport.handlePostMessage(req, res, body);
+        return;
+      }
+      res.writeHead(404).end("Not found");
+    } catch (e) {
+      if (!res.headersSent) { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: e.message })); }
+    }
+  }).listen(port, "0.0.0.0", () => log(`Server on http://0.0.0.0:${port}/sse`));
 }
 main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
