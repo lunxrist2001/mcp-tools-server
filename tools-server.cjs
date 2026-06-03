@@ -1,5 +1,4 @@
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
 const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
 const http = require("node:http"), https = require("node:https"), z = require("zod"), crypto = require("node:crypto");
 
@@ -23,74 +22,109 @@ function getTime(tz) {
 }
 
 const mem = new Map();
-const server = new Server({ name: "mcp-tools", version: "1.0.0" }, { capabilities: { tools: {} } });
+const sess = new Map();
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    { name: "fetch", description: "Fetch web page content", inputSchema: { type: "object", properties: { url: { type: "string" }, maxLength: { type: "number", default: 1e5 } }, required: ["url"] } },
-    { name: "get_time", description: "Get current time in a timezone (e.g. Europe/Moscow, America/New_York)", inputSchema: { type: "object", properties: { timezone: { type: "string", default: "UTC" } } } },
-    { name: "memory_save", description: "Save value to memory (key-value store)", inputSchema: { type: "object", properties: { key: { type: "string" }, value: { type: "string" } }, required: ["key","value"] } },
-    { name: "memory_get", description: "Get value from memory. *all* = list all, *clear* = clear", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
-    { name: "memory_delete", description: "Delete key from memory", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
-  ]
-}));
+const tools = [
+  { name: "fetch", description: "Fetch web page content", inputSchema: { type: "object", properties: { url: { type: "string" }, maxLength: { type: "number" } }, required: ["url"] } },
+  { name: "get_time", description: "Get current time in a timezone (e.g. Europe/Moscow, America/New_York)", inputSchema: { type: "object", properties: { timezone: { type: "string", default: "UTC" } } } },
+  { name: "memory_save", description: "Save value to key-value memory", inputSchema: { type: "object", properties: { key: { type: "string" }, value: { type: "string" } }, required: ["key","value"] } },
+  { name: "memory_get", description: "Get value from memory. *all* = list all, *clear* = clear", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } },
+  { name: "memory_delete", description: "Delete key from memory", inputSchema: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } }
+];
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args } = req.params;
+async function handleCall(name, args) {
   const ok = (t) => ({ content: [{ type: "text", text: t }] });
-  const err = (t) => ({ content: [{ type: "text", text: t }], isError: true });
+  const errMsg = (t) => ({ content: [{ type: "text", text: t }], isError: true });
   try {
     switch (name) {
-      case "fetch": { const p = z.object({ url: z.string(), maxLength: z.number().optional().default(1e5) }).parse(args); return ok(await fetchUrl(p.url, p.maxLength)); }
+      case "fetch": { const p = z.object({ url: z.string(), maxLength: z.number().optional() }).parse(args); return ok(await fetchUrl(p.url, p.maxLength || 1e5)); }
       case "get_time": { const p = z.object({ timezone: z.string().optional() }).parse(args); return ok(getTime(p.timezone)); }
-      case "memory_save": { const p = z.object({ key: z.string(), value: z.string() }).parse(args); mem.set(p.key, p.value); return ok(`OK: ${p.key}=${p.value.slice(0,100)}`); }
-      case "memory_get": { const p = z.object({ key: z.string() }).parse(args); if (p.key === "*all*") return ok(mem.size ? [...mem].map(([k,v])=>`${k}: ${v}`).join("\n") : "Empty"); if (p.key === "*clear*") { mem.clear(); return ok("Cleared"); } return ok(mem.has(p.key) ? `${p.key}: ${mem.get(p.key)}` : `Not found: ${p.key}`); }
-      case "memory_delete": { const p = z.object({ key: z.string() }).parse(args); return ok(mem.delete(p.key) ? `Deleted: ${p.key}` : `Not found: ${p.key}`); }
-      default: return err(`Unknown: ${name}`);
+      case "memory_save":
+        { const p = z.object({ key: z.string(), value: z.string() }).parse(args); mem.set(p.key, p.value); return ok(`OK: ${p.key}=${p.value.slice(0,100)}`); }
+      case "memory_get":
+        { const p = z.object({ key: z.string() }).parse(args);
+          if (p.key === "*all*") return ok(mem.size ? [...mem].map(([k,v])=>`${k}: ${v}`).join("\n") : "Empty");
+          if (p.key === "*clear*") { mem.clear(); return ok("Cleared"); }
+          return ok(mem.has(p.key) ? `${p.key}: ${mem.get(p.key)}` : `Not found: ${p.key}`); }
+      case "memory_delete":
+        { const p = z.object({ key: z.string() }).parse(args); return ok(mem.delete(p.key) ? `Deleted: ${p.key}` : `Not found: ${p.key}`); }
+      default: return errMsg(`Unknown tool: ${name}`);
     }
-  } catch (e) { return err(e instanceof z.ZodError ? e.errors.map(x=>x.path.join(".")+": "+x.message).join("; ") : e.message); }
-});
+  } catch (e) { return errMsg(e instanceof z.ZodError ? e.errors.map(x=>x.path.join(".")+": "+x.message).join("; ") : e.message); }
+}
 
-const transports = new Map();
+function json(id, result) {
+  return JSON.stringify({ jsonrpc: "2.0", id, result });
+}
+function jsonErr(id, code, msg) {
+  return JSON.stringify({ jsonrpc: "2.0", id, error: { code, message: msg } });
+}
 
 async function main() {
   const port = parseInt(process.env.PORT || "3001", 10);
   http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-      log(`${req.method} ${url.pathname}`);
-
-      // Health check
+      
       if (url.pathname === "/health" || url.pathname === "/") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", tools: mem.size > 0 ? "memory" : "ready" }));
-        return;
-      }
-
-      // SSE endpoint - Poke AI connects here
-      if (req.method === "GET" && (url.pathname === "/sse" || url.pathname === "/mcp")) {
-        const sessionId = crypto.randomUUID();
-        const transport = new SSEServerTransport("/sse", res);
-        transports.set(sessionId, transport);
-        res.on("close", () => { transports.delete(sessionId); log(`Session ${sessionId.slice(0,8)} closed`); });
-        await server.connect(transport);
-        return;
-      }
-
-      // POST endpoint for JSON-RPC messages
-      if (req.method === "POST" && (url.pathname === "/sse" || url.pathname === "/mcp")) {
-        const sessionId = url.searchParams.get("sessionId");
-        let transport = sessionId ? transports.get(sessionId) : null;
-        if (!transport) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "No active session" }));
-          return;
-        }
-        await transport.handlePostMessage(req, res, req.headers["content-type"]);
+        res.end(JSON.stringify({ status: "ok" }));
         return;
       }
       
-      res.writeHead(404).end("Not found");
+      // SSE endpoint for Poke AI
+      if (req.method === "GET" && url.pathname === "/sse") {
+        const sid = crypto.randomUUID();
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "mcp-session-id": sid
+        });
+        res.write(`event: endpoint\ndata: /sse?sessionId=${sid}\n\n`);
+        sess.set(sid, { res });
+        req.on("close", () => sess.delete(sid));
+        return;
+      }
+      
+      if (req.method !== "POST") {
+        res.writeHead(405).end("Method not allowed");
+        return;
+      }
+      
+      const chunks = []; for await (const c of req) chunks.push(c);
+      const raw = Buffer.concat(chunks).toString();
+      if (!raw.includes("jsonrpc")) { res.writeHead(400).end("Not JSON-RPC"); return; }
+      const body = JSON.parse(raw);
+      const id = body.id ?? null;
+      
+      if (body.method === "initialize") {
+        const sid = crypto.randomUUID();
+        res.writeHead(200, { "Content-Type": "application/json", "mcp-session-id": sid });
+        res.end(json(id, { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "mcp-tools", version: "1.0.0" } }));
+        return;
+      }
+      
+      if (body.method === "tools/list") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(json(id, { tools }));
+        return;
+      }
+      
+      if (body.method === "tools/call") {
+        const result = await handleCall(body.params.name, body.params.arguments);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(json(id, result));
+        return;
+      }
+      
+      if (body.method === "notifications/initialized") {
+        res.writeHead(202).end();
+        return;
+      }
+      
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(jsonErr(id, -32601, `Method not found: ${body.method}`));
     } catch (e) {
       log(`Error: ${e.message}`);
       if (!res.headersSent) {
