@@ -1,5 +1,5 @@
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
-const { SSEServerTransport } = require("@modelcontextprotocol/sdk/server/sse.js");
+const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { ListToolsRequestSchema, CallToolRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
 const http = require("node:http"), https = require("node:https"), z = require("zod");
 
@@ -23,7 +23,6 @@ function getTime(tz) {
 }
 
 const mem = new Map();
-
 const server = new Server({ name: "mcp-tools", version: "1.0.0" }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -54,35 +53,19 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 async function main() {
   const port = parseInt(process.env.PORT || "3001", 10);
-  const transports = {};
-
   http.createServer(async (req, res) => {
     try {
-      if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
-        res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok" })); return;
-      }
-      if (req.method === "GET" && req.url === "/sse") {
-        const transport = new SSEServerTransport("/messages", res);
-        const sessionId = transport._sessionId;
-        transports[sessionId] = transport;
-        res.on("close", () => { delete transports[sessionId]; });
-        await server.connect(transport);
-        return;
-      }
-      if (req.method === "POST" && req.url?.startsWith("/messages")) {
-        const url = new URL(req.url, "http://localhost");
-        const sessionId = url.searchParams.get("sessionId");
-        const transport = sessionId ? transports[sessionId] : null;
-        if (!transport) { res.writeHead(404).end("Session not found"); return; }
-        const chunks = []; for await (const c of req) chunks.push(c);
-        const body = JSON.parse(Buffer.concat(chunks).toString());
-        await transport.handlePostMessage(req, res, body);
-        return;
-      }
-      res.writeHead(404).end("Not found");
+      if (req.url === "/health" || req.url === "/") { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ status: "ok" })); return; }
+      if (req.method !== "POST") { res.writeHead(405).end("Method not allowed"); return; }
+      const chunks = []; for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+
+      const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
     } catch (e) {
       if (!res.headersSent) { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: e.message })); }
     }
-  }).listen(port, "0.0.0.0", () => log(`Server on http://0.0.0.0:${port}/sse`));
+  }).listen(port, "0.0.0.0", () => log(`Server on http://0.0.0.0:${port}`));
 }
 main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
