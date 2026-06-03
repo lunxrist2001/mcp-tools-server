@@ -1,0 +1,22 @@
+{
+  "name": "vk-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP сервер для управления VK через браузерную автоматизацию",
+  "type": "module",
+  "main": "dist/index_new.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index_new.js",
+    "dev": "npx tsx src/index_new.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.16.1",
+    "playwright": "^1.60.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "tsx": "^4.0.0"
+  }
+}
