@@ -66,13 +66,13 @@ async function main() {
     try {
       const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
       
-      if (url.pathname === "/health" || url.pathname === "/") {
+      if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/")) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "ok" }));
         return;
       }
       
-      // SSE endpoint for Poke AI
+      // SSE endpoint
       if (req.method === "GET" && url.pathname === "/sse") {
         const sid = crypto.randomUUID();
         res.writeHead(200, {
@@ -96,35 +96,47 @@ async function main() {
       const raw = Buffer.concat(chunks).toString();
       if (!raw.includes("jsonrpc")) { res.writeHead(400).end("Not JSON-RPC"); return; }
       const body = JSON.parse(raw);
-      const id = body.id ?? null;
+      const messages = Array.isArray(body) ? body : [body];
       
-      if (body.method === "initialize") {
-        const sid = crypto.randomUUID();
-        res.writeHead(200, { "Content-Type": "application/json", "mcp-session-id": sid });
-        res.end(json(id, { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "mcp-tools", version: "1.0.0" } }));
-        return;
+      let responses = [];
+      for (const msg of messages) {
+        const id = msg.id ?? null;
+        
+        if (msg.method === "initialize") {
+          const sid = crypto.randomUUID();
+          responses.push(json(id, { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "mcp-tools", version: "1.0.0" } }));
+          res.setHeader("mcp-session-id", sid);
+          continue;
+        }
+        
+        if (msg.method === "tools/list") {
+          responses.push(json(id, { tools }));
+          continue;
+        }
+        
+        if (msg.method === "tools/call") {
+          const result = await handleCall(msg.params.name, msg.params.arguments);
+          responses.push(json(id, result));
+          continue;
+        }
+        
+        if (msg.method?.startsWith("notifications/") || msg.method?.startsWith("$/")) {
+          // Notifications - no response needed
+          continue;
+        }
+        
+        responses.push(jsonErr(id, -32601, `Method not found: ${msg.method}`));
       }
       
-      if (body.method === "tools/list") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(json(id, { tools }));
-        return;
-      }
-      
-      if (body.method === "tools/call") {
-        const result = await handleCall(body.params.name, body.params.arguments);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(json(id, result));
-        return;
-      }
-      
-      if (body.method === "notifications/initialized") {
+      if (responses.length === 0) {
         res.writeHead(202).end();
-        return;
+      } else if (responses.length === 1) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(responses[0]);
+      } else {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(`[${responses.join(",")}]`);
       }
-      
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(jsonErr(id, -32601, `Method not found: ${body.method}`));
     } catch (e) {
       log(`Error: ${e.message}`);
       if (!res.headersSent) {
