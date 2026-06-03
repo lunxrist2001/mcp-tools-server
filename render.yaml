@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: mcp-tools-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node tools-server.cjs
+    healthCheckPath: /mcp
+    numInstances: 1
+    repo: https://github.com/lunxrist2001/mcp-tools-server
